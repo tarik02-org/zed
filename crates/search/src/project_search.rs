@@ -247,19 +247,19 @@ fn contains_uppercase(str: &str) -> bool {
     str.chars().any(|c| c.is_uppercase())
 }
 
-pub(crate) const SEARCH_ON_TYPE_DEBOUNCE: Duration = Duration::from_millis(250);
+pub(crate) const SEARCH_ON_TYPE_DEBOUNCE: Duration = Duration::from_millis(300);
 
 pub struct ProjectSearch {
     pub(crate) project: Entity<Project>,
     pub excerpts: Entity<MultiBuffer>,
     pub pending_search: Option<Task<Option<SearchResults<SearchResult>>>>,
-    pending_search_reuses_excerpts: bool,
     pub match_ranges: Vec<Range<Anchor>>,
     pub(crate) active_query: Option<SearchQuery>,
     last_search_query_text: Option<String>,
     pub search_id: usize,
     search_state: SearchState,
-    search_input_confirmed: bool,
+    phase: SearchPhase,
+    reuses_excerpts: bool,
     search_history_cursor: SearchHistoryCursor,
     search_included_history_cursor: SearchHistoryCursor,
     search_excluded_history_cursor: SearchHistoryCursor,
@@ -271,6 +271,28 @@ pub struct ProjectSearch {
 enum SearchMode {
     Manual,
     OnType,
+}
+
+/// Tracks how the current results were produced, so the view knows whether to preserve the
+/// user's scroll/selection (mid-typing) or take focus and jump to the first match (confirmed).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SearchPhase {
+    #[default]
+    Idle,
+    /// A search-on-type run whose results the user has not confirmed yet.
+    Typing,
+    /// A manual search, or an on-type search the user confirmed with Enter.
+    Confirmed,
+}
+
+impl SearchPhase {
+    fn is_typing(self) -> bool {
+        self == SearchPhase::Typing
+    }
+
+    fn is_confirmed(self) -> bool {
+        self == SearchPhase::Confirmed
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -355,13 +377,13 @@ impl ProjectSearch {
             project,
             excerpts,
             pending_search: Default::default(),
-            pending_search_reuses_excerpts: false,
             match_ranges: Default::default(),
             active_query: None,
             last_search_query_text: None,
             search_id: 0,
             search_state: SearchState::Idle,
-            search_input_confirmed: false,
+            phase: SearchPhase::Idle,
+            reuses_excerpts: false,
             search_history_cursor: Default::default(),
             search_included_history_cursor: Default::default(),
             search_excluded_history_cursor: Default::default(),
@@ -381,7 +403,6 @@ impl ProjectSearch {
                 project: self.project.clone(),
                 excerpts,
                 pending_search: Default::default(),
-                pending_search_reuses_excerpts: false,
                 match_ranges: self.match_ranges.clone(),
                 active_query: self.active_query.clone(),
                 last_search_query_text: self.last_search_query_text.clone(),
@@ -391,7 +412,12 @@ impl ProjectSearch {
                 } else {
                     self.search_state
                 },
-                search_input_confirmed: self.search_input_confirmed,
+                phase: if self.phase.is_confirmed() {
+                    SearchPhase::Confirmed
+                } else {
+                    SearchPhase::Idle
+                },
+                reuses_excerpts: false,
                 search_history_cursor: self.search_history_cursor.clone(),
                 search_included_history_cursor: self.search_included_history_cursor.clone(),
                 search_excluded_history_cursor: self.search_excluded_history_cursor.clone(),
@@ -473,9 +499,15 @@ impl ProjectSearch {
         if mode == SearchMode::Manual {
             self.record_search_history(cx);
         }
-        self.match_ranges.clear();
-        self.search_input_confirmed = mode == SearchMode::Manual;
-        self.pending_search_reuses_excerpts = reuse_excerpts;
+        self.phase = if mode == SearchMode::Manual {
+            SearchPhase::Confirmed
+        } else {
+            SearchPhase::Typing
+        };
+        self.reuses_excerpts = reuse_excerpts;
+        if !reuse_excerpts {
+            self.match_ranges.clear();
+        }
         self.search_state = SearchState::Running(SearchActivity::Searching);
         self.pending_search = Some(cx.spawn(async move |project_search, cx| {
             if !reuse_excerpts {
@@ -503,11 +535,11 @@ impl ProjectSearch {
 
     fn clear(&mut self, cx: &mut Context<Self>) {
         self.pending_search = None;
-        self.pending_search_reuses_excerpts = false;
         self.match_ranges.clear();
         self.excerpts.update(cx, |excerpts, cx| excerpts.clear(cx));
         self.search_state = SearchState::Idle;
-        self.search_input_confirmed = false;
+        self.phase = SearchPhase::Idle;
+        self.reuses_excerpts = false;
         self.active_query = None;
         self.last_search_query_text = None;
         cx.notify();
@@ -546,7 +578,7 @@ impl ProjectSearch {
         let project_search_turning_into_text_finder =
             Arc::clone(&self.project_search_turning_into_text_finder);
 
-        self.pending_search_reuses_excerpts = false;
+        self.reuses_excerpts = false;
         self.pending_search = Some(cx.spawn(async move |project_search, cx| {
             consume_search_stream(
                 project_search,
@@ -565,6 +597,8 @@ impl ProjectSearch {
 ///
 /// When `reuse_excerpts` is set, existing excerpts are diffed against the incoming (PathKey-sorted)
 /// results instead of clearing the multibuffer up front, so unchanged files keep their excerpts.
+/// The new match ranges are accumulated separately and swapped in only once the stream finishes,
+/// so the previous matches (and their highlights) stay on screen while the search runs.
 async fn consume_search_stream(
     project_search: WeakEntity<ProjectSearch>,
     search_results: SearchResults<SearchResult>,
@@ -588,6 +622,7 @@ async fn consume_search_stream(
         Vec::new().into_iter().peekable()
     };
     let mut last_seen_path: Option<PathKey> = None;
+    let mut new_match_ranges = Vec::new();
     while let Some(results) = matches.next().await {
         let (buffers_with_ranges, has_reached_limit, search_activity) = cx
             .background_executor()
@@ -630,6 +665,7 @@ async fn consume_search_stream(
                 buffers_with_ranges,
                 &mut stale_paths,
                 &mut last_seen_path,
+                &mut new_match_ranges,
                 cx,
             )
             .await?;
@@ -680,19 +716,20 @@ async fn consume_search_stream(
 
     project_search
         .update(cx, |project_search, cx| {
-            project_search.search_state = if project_search.match_ranges.is_empty() {
-                SearchState::Completed(SearchCompletion::NoResults)
-            } else {
-                SearchState::Completed(SearchCompletion::Results { limit_reached })
-            };
-            project_search.pending_search.take();
             if reuse_excerpts {
                 project_search.excerpts.update(cx, |excerpts, cx| {
                     for stale in stale_paths.by_ref() {
                         excerpts.remove_excerpts(stale, cx);
                     }
                 });
+                project_search.match_ranges = new_match_ranges;
             }
+            project_search.search_state = if project_search.match_ranges.is_empty() {
+                SearchState::Completed(SearchCompletion::NoResults)
+            } else {
+                SearchState::Completed(SearchCompletion::Results { limit_reached })
+            };
+            project_search.pending_search.take();
             cx.notify();
         })
         .ok()?;
@@ -701,12 +738,15 @@ async fn consume_search_stream(
 }
 
 /// Merge one chunk of PathKey-sorted results into the multibuffer, reusing excerpts for files that
-/// still match and pruning `stale_paths` that sort before the incoming files.
+/// still match and pruning `stale_paths` that sort before the incoming files. The resulting match
+/// ranges are appended to `new_match_ranges`, which the caller swaps into the model once the whole
+/// stream is drained.
 async fn apply_reused_chunk(
     project_search: &WeakEntity<ProjectSearch>,
     buffers_with_ranges: Vec<(Entity<language::Buffer>, Vec<Range<text::Anchor>>)>,
     stale_paths: &mut std::iter::Peekable<std::vec::IntoIter<PathKey>>,
     last_seen_path: &mut Option<PathKey>,
+    new_match_ranges: &mut Vec<Range<Anchor>>,
     cx: &mut AsyncApp,
 ) -> Option<()> {
     let buffers_with_ranges = buffers_with_ranges
@@ -748,12 +788,7 @@ async fn apply_reused_chunk(
         .ok()?;
     while let Some(ranges) = chunk_ranges.next().await {
         smol::future::yield_now().await;
-        project_search
-            .update(cx, |project_search, cx| {
-                project_search.match_ranges.extend(ranges);
-                cx.notify();
-            })
-            .ok()?;
+        new_match_ranges.extend(ranges);
     }
     Some(())
 }
@@ -1950,41 +1985,44 @@ impl ProjectSearchView {
 
     fn entity_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let model = self.entity.read(cx);
-        let search_input_confirmed = model.search_input_confirmed;
-        let match_ranges = model.match_ranges.clone();
+        let phase = model.phase;
         let search_on_type = EditorSettings::get_global(cx).search.search_on_type;
-        let reuses_excerpts_pending =
-            model.pending_search.is_some() && model.pending_search_reuses_excerpts;
+        let reuse_pending = model.pending_search.is_some() && model.reuses_excerpts;
+        let preserve_view = phase.is_typing() || reuse_pending;
 
-        if match_ranges.is_empty() {
-            if !reuses_excerpts_pending {
+        if model.match_ranges.is_empty() {
+            if !reuse_pending {
                 self.active_match_index = None;
             }
             self.results_editor.update(cx, |editor, cx| {
                 editor.clear_background_highlights(HighlightKey::ProjectSearchView, cx);
             });
         } else {
+            let match_ranges = model.match_ranges.clone();
             self.active_match_index = Some(0);
             self.update_match_index(cx);
-            let prev_search_id = mem::replace(&mut self.search_id, self.entity.read(cx).search_id);
-            let is_new_search = self.search_id != prev_search_id;
-            self.results_editor.update(cx, |editor, cx| {
+            // While typing, do not advance `search_id` either: the old results are still on screen,
+            // so a premature bump would make the eventual confirmed swap look like a stale search
+            // and skip selecting/scrolling to the first match.
+            if !preserve_view {
+                let prev_search_id =
+                    mem::replace(&mut self.search_id, self.entity.read(cx).search_id);
+                let is_new_search = self.search_id != prev_search_id;
                 if is_new_search {
-                    let range_to_select = match_ranges
-                        .first()
-                        .map(|range| editor.range_for_match(range));
-                    editor.change_selections(Default::default(), window, cx, |s| {
-                        s.select_ranges(range_to_select)
+                    self.results_editor.update(cx, |editor, cx| {
+                        let range_to_select = match_ranges
+                            .first()
+                            .map(|range| editor.range_for_match(range));
+                        editor.change_selections(Default::default(), window, cx, |s| {
+                            s.select_ranges(range_to_select)
+                        });
+                        editor.scroll(Point::default(), window, cx);
                     });
-                    editor.scroll(Point::default(), window, cx);
+                    let should_auto_focus = phase.is_confirmed() || !search_on_type;
+                    if should_auto_focus && self.query_editor.focus_handle(cx).is_focused(window) {
+                        self.focus_results_editor(window, cx);
+                    }
                 }
-            });
-            let should_auto_focus = search_input_confirmed || !search_on_type;
-            if is_new_search
-                && should_auto_focus
-                && self.query_editor.focus_handle(cx).is_focused(window)
-            {
-                self.focus_results_editor(window, cx);
             }
         }
 
@@ -2218,10 +2256,17 @@ impl ProjectSearchBar {
                         search_view.search(SearchMode::OnType, cx);
                     }
                     search_view.entity.update(cx, |model, cx| {
-                        model.search_input_confirmed = true;
+                        model.phase = SearchPhase::Confirmed;
                         model.record_search_history(cx);
                     });
-                    if !search_view.entity.read(cx).match_ranges.is_empty() {
+                    let (pending, has_matches) = {
+                        let model = search_view.entity.read(cx);
+                        (
+                            model.pending_search.is_some(),
+                            !model.match_ranges.is_empty(),
+                        )
+                    };
+                    if !pending && has_matches {
                         search_view.select_first_match(window, cx);
                         search_view.focus_results_editor(window, cx);
                     }
@@ -6591,6 +6636,135 @@ pub mod tests {
     }
 
     #[gpui::test]
+    async fn test_confirm_while_reusing_search_pending_defers_focus(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .editor
+                        .search
+                        .get_or_insert_default()
+                        .search_on_type = Some(true);
+                });
+            });
+        });
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                "one.rs": "const ONE: usize = 1;",
+                "two.rs": "const TWO: usize = one::ONE + one::ONE;",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let search_bar = window.build_entity(cx, |_, _| ProjectSearchBar::new());
+
+        workspace.update_in(cx, {
+            let search_bar = search_bar.clone();
+            |workspace, window, cx| {
+                workspace.panes()[0].update(cx, |pane, cx| {
+                    pane.toolbar()
+                        .update(cx, |toolbar, cx| toolbar.add_item(search_bar, window, cx))
+                });
+                ProjectSearchView::new_search(workspace, &workspace::NewSearch, window, cx);
+            }
+        });
+
+        let search_view = cx
+            .read(|cx| {
+                workspace
+                    .read(cx)
+                    .active_pane()
+                    .read(cx)
+                    .active_item()
+                    .and_then(|item| item.downcast::<ProjectSearchView>())
+            })
+            .expect("Search view expected to appear after new search event trigger");
+
+        // Run an initial on-type search for "ONE" to completion.
+        window
+            .update(cx, |_, window, cx| {
+                search_view.update(cx, |search_view, cx| {
+                    search_view.query_editor.update(cx, |query_editor, cx| {
+                        query_editor.set_text("ONE", window, cx);
+                    });
+                });
+            })
+            .unwrap();
+        cx.background_executor
+            .advance_clock(SEARCH_ON_TYPE_DEBOUNCE + Duration::from_millis(50));
+        cx.background_executor.run_until_parked();
+
+        // Change the query but confirm before the debounce fires: `confirm` starts a reusing
+        // search that is still pending, so `match_ranges` still holds "ONE" results.
+        window
+            .update(cx, |_, window, cx| {
+                search_view.update(cx, |search_view, cx| {
+                    search_view.query_editor.update(cx, |query_editor, cx| {
+                        query_editor.set_text("TWO", window, cx);
+                    });
+                });
+                search_bar.update(cx, |search_bar, cx| {
+                    search_bar.confirm(&Confirm, window, cx);
+                });
+            })
+            .unwrap();
+
+        window
+            .update(cx, |_, window, cx| {
+                search_view.update(cx, |search_view, cx| {
+                    assert!(
+                        search_view.entity.read(cx).pending_search.is_some(),
+                        "Confirming a stale query starts a reusing search that is still pending",
+                    );
+                    assert!(
+                        search_view.query_editor.focus_handle(cx).is_focused(window),
+                        "Focus must stay on the query editor until the pending search resolves \
+                         so we never select against the previous query's stale matches",
+                    );
+                });
+            })
+            .unwrap();
+
+        // Once the confirmed search resolves, focus shifts to the fresh results.
+        cx.background_executor.run_until_parked();
+        window
+            .update(cx, |_, window, cx| {
+                search_view.update(cx, |search_view, cx| {
+                    assert!(
+                        search_view
+                            .results_editor
+                            .focus_handle(cx)
+                            .is_focused(window),
+                        "Results editor should be focused after the confirmed search completes",
+                    );
+                    assert_eq!(search_view.active_match_index, Some(0));
+                    let model = search_view.entity.read(cx);
+                    let snapshot = model.excerpts.read(cx).snapshot(cx);
+                    let match_texts = model
+                        .match_ranges
+                        .iter()
+                        .map(|range| snapshot.text_for_range(range.clone()).collect::<String>())
+                        .collect::<Vec<_>>();
+                    assert!(
+                        match_texts.iter().all(|text| text == "TWO"),
+                        "Selection and results should reflect the confirmed query, got {match_texts:?}",
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     async fn test_incremental_search_reuses_unchanged_excerpts(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -6897,8 +7071,6 @@ pub mod tests {
         perform_search(search_view, "ONE", cx);
         assert_eq!(read_match_count(search_view, cx), 5);
 
-        // Start an incremental search but do not let it complete: `match_ranges` is
-        // cleared synchronously while `active_match_index` is retained.
         search_view
             .update(cx, |search_view, _window, cx| {
                 search_view.search(SearchMode::OnType, cx);
@@ -6906,15 +7078,145 @@ pub mod tests {
             .unwrap();
         search_view
             .update(cx, |search_view, window, cx| {
-                assert_eq!(search_view.entity.read(cx).match_ranges.len(), 0);
+                assert_eq!(
+                    search_view.entity.read(cx).match_ranges.len(),
+                    5,
+                    "previous matches stay in place until the pending incremental search completes"
+                );
                 assert_eq!(search_view.active_match_index, Some(0));
                 search_view.select_match(Direction::Next, window, cx);
                 search_view.select_match(Direction::Prev, window, cx);
-                assert_eq!(search_view.active_match_index, Some(0));
+                assert_eq!(
+                    search_view.active_match_index,
+                    Some(0),
+                    "navigation works against the preserved matches instead of an empty list"
+                );
             })
             .unwrap();
 
         cx.background_executor.run_until_parked();
         assert_eq!(read_match_count(search_view, cx), 5);
+    }
+
+    #[gpui::test]
+    async fn test_incremental_search_preserves_scroll_position(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                "1.txt": "\n\n\n\n\n A \n\n\n\n\n",
+                "2.txt": "\n\n\n\n\n A \n\n\n\n\n",
+                "3.rs": "\n\n\n\n\n A \n\n\n\n\n",
+                "4.rs": "\n\n\n\n\n A \n\n\n\n\n",
+                "5.rs": "\n\n\n\n\n A \n\n\n\n\n",
+                "6.rs": "\n\n\n\n\n A \n\n\n\n\n",
+                "7.rs": "\n\n\n\n\n A \n\n\n\n\n",
+                "8.rs": "\n\n\n\n\n A \n\n\n\n\n",
+                "9.rs": "\n\n\n\n\n A \n\n\n\n\n",
+                "a.rs": "\n\n\n\n\n A \n\n\n\n\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let search = cx.new(|cx| ProjectSearch::new(project, cx));
+        let search_view = cx.add_window(|window, cx| {
+            ProjectSearchView::new(workspace.downgrade(), search.clone(), window, cx, None)
+        });
+
+        perform_search(search_view, "A", cx);
+        search_view
+            .update(cx, |search_view, window, cx| {
+                search_view.results_editor.update(cx, |results_editor, cx| {
+                    assert_eq!(
+                        results_editor.scroll_position(cx),
+                        Point::default(),
+                        "a confirmed search scrolls to the top"
+                    );
+                    results_editor.scroll(Point::new(0., f64::MAX), window, cx);
+                });
+            })
+            .unwrap();
+
+        perform_incremental_search(search_view, "A", cx);
+        search_view
+            .update(cx, |search_view, _, cx| {
+                search_view.results_editor.update(cx, |results_editor, cx| {
+                    assert!(
+                        results_editor.scroll_position(cx).y > 0.,
+                        "search-on-type should not scroll the results back to the top"
+                    );
+                });
+            })
+            .unwrap();
+
+        perform_search(search_view, "A", cx);
+        search_view
+            .update(cx, |search_view, _, cx| {
+                search_view.results_editor.update(cx, |results_editor, cx| {
+                    assert_eq!(
+                        results_editor.scroll_position(cx),
+                        Point::default(),
+                        "confirming the query scrolls back to the top"
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_search_on_type_surfaces_query_errors(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(path!("/dir"), json!({ "one.rs": "const ONE: usize = 1;" }))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let search = cx.new(|cx| ProjectSearch::new(project.clone(), cx));
+        let search_view = cx.add_window(|window, cx| {
+            ProjectSearchView::new(workspace.downgrade(), search.clone(), window, cx, None)
+        });
+
+        search_view
+            .update(cx, |search_view, window, cx| {
+                search_view.search_options.insert(SearchOptions::REGEX);
+                search_view.query_editor.update(cx, |query_editor, cx| {
+                    query_editor.set_text("(unclosed", window, cx)
+                });
+                search_view.search(SearchMode::OnType, cx);
+                assert!(
+                    search_view
+                        .panels_with_errors
+                        .contains_key(&InputPanel::Query),
+                    "an invalid regex must surface an error even without confirming, otherwise \
+                     search-on-type results silently stop updating"
+                );
+            })
+            .unwrap();
+
+        search_view
+            .update(cx, |search_view, window, cx| {
+                search_view.query_editor.update(cx, |query_editor, cx| {
+                    query_editor.set_text("closed", window, cx)
+                });
+                search_view.search(SearchMode::OnType, cx);
+                assert_eq!(
+                    search_view.panels_with_errors.get(&InputPanel::Query),
+                    None,
+                    "fixing the query clears the error again"
+                );
+            })
+            .unwrap();
     }
 }

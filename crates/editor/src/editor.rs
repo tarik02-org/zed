@@ -3108,7 +3108,7 @@ impl Editor {
         let GutterLineNumberWidth::Sticky { min_digits } = self.gutter_line_number_width else {
             return;
         };
-        let widest_line_number = self.buffer.read(cx).snapshot(cx).widest_line_number();
+        let widest_line_number = self.buffer.read(cx).read(cx).widest_line_number();
         let digits = (widest_line_number.max(1).ilog10() + 1) as usize;
         if digits > min_digits {
             self.gutter_line_number_width = GutterLineNumberWidth::Sticky { min_digits: digits };
