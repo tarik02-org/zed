@@ -896,6 +896,8 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_exclusive_zone(&self, _zone: Pixels) {}
     #[cfg(all(target_os = "linux", feature = "wayland"))]
     fn set_exclusive_edge(&self, _edge: layer_shell::Anchor) {}
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    fn set_keyboard_interactivity(&self, _interactivity: layer_shell::KeyboardInteractivity) {}
     fn set_input_region(&self, _region: Option<&[Bounds<Pixels>]>) {}
     fn window_decorations(&self) -> Decorations {
         Decorations::Server
@@ -1803,6 +1805,13 @@ pub struct WindowOptions {
     /// Whether the window should be shown when created
     pub show: bool,
 
+    /// Whether the compositor should place the window under the current pointer.
+    /// Supported on Wayland compositors that implement the KDE Plasma shell protocol.
+    pub open_under_cursor: bool,
+
+    /// An optional Wayland activation token to apply to the new window.
+    pub activation_token: Option<String>,
+
     /// The kind of window to create
     pub kind: WindowKind,
 
@@ -1903,6 +1912,12 @@ pub struct WindowParams {
     #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
     pub show: bool,
 
+    /// Whether the compositor should place the window under the current pointer.
+    pub open_under_cursor: bool,
+
+    /// An optional Wayland activation token to apply to the new window.
+    pub activation_token: Option<String>,
+
     /// An image to set as the window icon (x11 only)
     #[cfg_attr(feature = "wayland", allow(dead_code))]
     pub icon: Option<Arc<image::RgbaImage>>,
@@ -1965,6 +1980,8 @@ impl Default for WindowOptions {
             }),
             focus: true,
             show: true,
+            open_under_cursor: false,
+            activation_token: None,
             kind: WindowKind::Normal,
             is_movable: true,
             app_owns_titlebar_drag: false,

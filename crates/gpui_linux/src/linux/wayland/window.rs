@@ -27,6 +27,7 @@ use wayland_protocols::{
     xdg::dialog::v1::client::xdg_dialog_v1::XdgDialogV1,
 };
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
+use wayland_protocols_plasma::plasma_shell::client::org_kde_plasma_surface;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
@@ -37,7 +38,7 @@ use gpui::{
     PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size,
     Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
     WindowControls, WindowDecorations, WindowKind, WindowParams,
-    layer_shell::{Anchor, LayerShellNotSupportedError},
+    layer_shell::{Anchor, KeyboardInteractivity, LayerShellNotSupportedError},
     popup::PopupOptions,
     px, size,
 };
@@ -104,6 +105,7 @@ pub struct WaylandWindowState {
     app_id: Option<String>,
     appearance: WindowAppearance,
     blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
+    plasma_surface: Option<org_kde_plasma_surface::OrgKdePlasmaSurface>,
     viewport: Option<wp_viewport::WpViewport>,
     outputs: HashMap<ObjectId, Output>,
     display: Option<(ObjectId, Output)>,
@@ -498,6 +500,19 @@ impl WaylandSurfaceState {
         }
     }
 
+    fn set_keyboard_interactivity(&self, interactivity: KeyboardInteractivity) -> bool {
+        if let WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState { layer_surface, .. }) =
+            self
+        {
+            layer_surface.set_keyboard_interactivity(
+                super::layer_shell::wayland_keyboard_interactivity(interactivity),
+            );
+            true
+        } else {
+            false
+        }
+    }
+
     fn destroy(&mut self) {
         match self {
             WaylandSurfaceState::Xdg(WaylandXdgSurfaceState {
@@ -543,6 +558,7 @@ impl WaylandWindowState {
         handle: AnyWindowHandle,
         surface: wl_surface::WlSurface,
         surface_state: WaylandSurfaceState,
+        plasma_surface: Option<org_kde_plasma_surface::OrgKdePlasmaSurface>,
         appearance: WindowAppearance,
         viewport: Option<wp_viewport::WpViewport>,
         client: WaylandClientStatePtr,
@@ -599,6 +615,7 @@ impl WaylandWindowState {
             surface,
             app_id: options.app_id,
             blur: None,
+            plasma_surface,
             viewport,
             globals,
             outputs: HashMap::default(),
@@ -700,6 +717,11 @@ impl Drop for WaylandWindow {
             decoration.destroy();
         }
 
+        // Plasma metadata must be destroyed before its wl_surface.
+        if let Some(plasma_surface) = &state.plasma_surface {
+            plasma_surface.destroy();
+        }
+
         // Surface state might contain xdg_toplevel/xdg_surface which can be destroyed now that
         // decorations are gone. layer_surface has no dependencies.
         state.surface_state.destroy();
@@ -747,6 +769,18 @@ impl WaylandWindow {
         popup_grab: Option<(u32, wl_seat::WlSeat)>,
         target_output: Option<wl_output::WlOutput>,
     ) -> anyhow::Result<(Self, ObjectId)> {
+        if params.open_under_cursor
+            && (!matches!(&params.kind, WindowKind::PopUp)
+                || !globals
+                    .plasma_shell
+                    .as_ref()
+                    .is_some_and(|plasma_shell| plasma_shell.version() >= 7))
+        {
+            return Err(anyhow::anyhow!(
+                "Wayland compositor does not support opening this window under the cursor"
+            ));
+        }
+
         let surface = globals.compositor.create_surface(&globals.qh, ());
         let surface_state = WaylandSurfaceState::new(
             &surface,
@@ -756,6 +790,31 @@ impl WaylandWindow {
             popup_grab,
             target_output,
         )?;
+
+        let plasma_surface = if params.open_under_cursor
+            && matches!(&surface_state, WaylandSurfaceState::Xdg(_))
+            && let Some(plasma_shell) = globals.plasma_shell.as_ref()
+            && plasma_shell.version() >= 7
+        {
+            let plasma_surface = plasma_shell.get_surface(&surface, &globals.qh, ());
+            plasma_surface.open_under_cursor();
+            plasma_surface.set_panel_takes_focus(1);
+            if plasma_surface.version() >= 8 {
+                plasma_surface.set_role(org_kde_plasma_surface::Role::Appletpopup.into());
+                plasma_surface.set_skip_taskbar(1);
+                plasma_surface.set_skip_switcher(1);
+            }
+            Some(plasma_surface)
+        } else {
+            None
+        };
+
+        if let Some(token) = params.activation_token.as_ref()
+            && matches!(&surface_state, WaylandSurfaceState::Xdg(_))
+            && let Some(activation) = globals.activation.as_ref()
+        {
+            activation.activate(token.clone(), &surface);
+        }
 
         if let Some(fractional_scale_manager) = globals.fractional_scale_manager.as_ref() {
             fractional_scale_manager.get_fractional_scale(&surface, &globals.qh, surface.id());
@@ -771,6 +830,7 @@ impl WaylandWindow {
                 handle,
                 surface.clone(),
                 surface_state,
+                plasma_surface,
                 appearance,
                 viewport,
                 client,
@@ -782,9 +842,6 @@ impl WaylandWindow {
             )?)),
             callbacks: Rc::new(RefCell::new(Callbacks::default())),
         });
-
-        // Kick things off
-        surface.commit();
 
         Ok((this, surface.id()))
     }
@@ -1286,8 +1343,13 @@ impl WaylandWindowStatePtr {
         {
             let state = self.state.borrow();
             if let Some(viewport) = &state.viewport {
-                viewport
-                    .set_destination(f32::from(size.width) as i32, f32::from(size.height) as i32);
+                let width = f32::from(size.width) as i32;
+                let height = f32::from(size.height) as i32;
+                if width > 0 && height > 0 {
+                    viewport.set_destination(width, height);
+                } else {
+                    viewport.set_destination(-1, -1);
+                }
             }
         }
     }
@@ -1815,6 +1877,16 @@ impl PlatformWindow for WaylandWindow {
         }
     }
 
+    fn set_keyboard_interactivity(&self, interactivity: KeyboardInteractivity) {
+        let state = self.borrow();
+        if state
+            .surface_state
+            .set_keyboard_interactivity(interactivity)
+        {
+            state.surface.commit();
+        }
+    }
+
     fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
         let state = self.borrow();
         match region {
@@ -1972,29 +2044,33 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
     let opaque = !state.is_transparent();
 
     state.renderer.update_transparency(!opaque);
-    let opaque_area = state.window_bounds.map(|v| f32::from(v) as i32);
-    opaque_area.inset(f32::from(state.inset()) as i32);
-
-    let region = state
-        .globals
-        .compositor
-        .create_region(&state.globals.qh, ());
-    region.add(
-        opaque_area.origin.x,
-        opaque_area.origin.y,
-        opaque_area.size.width,
-        opaque_area.size.height,
-    );
-
     // Note that rounded corners make this rectangle API hard to work with.
     // As this is common when using CSD, let's just disable this API.
     if state.background_appearance == WindowBackgroundAppearance::Opaque
         && state.decorations == WindowDecorations::Server
     {
-        // Promise the compositor that this region of the window surface
-        // contains no transparent pixels. This allows the compositor to skip
-        // updating whatever is behind the surface for better performance.
-        state.surface.set_opaque_region(Some(&region));
+        let opaque_area = state.window_bounds.map(|v| f32::from(v) as i32);
+        opaque_area.inset(f32::from(state.inset()) as i32);
+
+        if opaque_area.size.width > 0 && opaque_area.size.height > 0 {
+            let region = state
+                .globals
+                .compositor
+                .create_region(&state.globals.qh, ());
+            region.add(
+                opaque_area.origin.x,
+                opaque_area.origin.y,
+                opaque_area.size.width,
+                opaque_area.size.height,
+            );
+            // Promise the compositor that this region of the window surface
+            // contains no transparent pixels. This allows the compositor to skip
+            // updating whatever is behind the surface for better performance.
+            state.surface.set_opaque_region(Some(&region));
+            region.destroy();
+        } else {
+            state.surface.set_opaque_region(None);
+        }
     } else {
         state.surface.set_opaque_region(None);
     }
@@ -2014,8 +2090,6 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
             }
         }
     }
-
-    region.destroy();
 }
 
 pub(crate) trait WindowDecorationsExt {

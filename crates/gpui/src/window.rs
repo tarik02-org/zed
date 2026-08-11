@@ -1378,6 +1378,8 @@ impl Window {
             titlebar,
             focus,
             show,
+            open_under_cursor,
+            activation_token,
             kind,
             is_movable,
             app_owns_titlebar_drag,
@@ -1414,6 +1416,8 @@ impl Window {
                 is_minimizable,
                 focus,
                 show,
+                open_under_cursor,
+                activation_token,
                 display_id,
                 window_min_size,
                 app_id: app_id.clone(),
@@ -2139,6 +2143,18 @@ impl Window {
     #[cfg(all(target_os = "linux", feature = "wayland"))]
     pub fn set_exclusive_edge(&self, edge: crate::layer_shell::Anchor) {
         self.platform_window.set_exclusive_edge(edge);
+    }
+
+    /// Set how a layer-shell surface receives keyboard focus.
+    ///
+    /// The compositor applies the change on the next surface commit.
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    pub fn set_keyboard_interactivity(
+        &self,
+        interactivity: crate::layer_shell::KeyboardInteractivity,
+    ) {
+        self.platform_window
+            .set_keyboard_interactivity(interactivity);
     }
 
     /// Start an interactive window resize operation if this window is resizable.
